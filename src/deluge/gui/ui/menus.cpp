@@ -205,6 +205,7 @@
 #include "gui/menu_item/song/midi_learn.h"
 #include "gui/menu_item/source/patched_param/modulator_feedback.h"
 #include "gui/menu_item/source/patched_param/modulator_level.h"
+#include "gui/menu_item/stem_export/split_kits.h"
 #include "gui/menu_item/stem_export/start.h"
 #include "gui/menu_item/stutter/direction.h"
 #include "gui/menu_item/stutter/quantized.h"
@@ -1791,6 +1792,21 @@ PLACE_SDRAM_BSS ToggleBool configureOfflineRenderingMenu{STRING_FOR_CONFIGURE_EX
                                                          stemExport.renderOffline};
 PLACE_SDRAM_BSS ToggleBool configureMixdownMenu{STRING_FOR_CONFIGURE_EXPORT_STEMS_MIXDOWN,
                                                 STRING_FOR_CONFIGURE_EXPORT_STEMS_MIXDOWN, stemExport.exportMixdown};
+PLACE_SDRAM_BSS ToggleBool configureSplitKitsEnabledMenu{
+    STRING_FOR_ENABLED, STRING_FOR_CONFIGURE_EXPORT_STEMS_SPLIT_KITS, stemExport.splitKitsIntoDrums};
+PLACE_SDRAM_BSS ToggleBool configureSplitKitsKitFXMenu{
+    STRING_FOR_CONFIGURE_EXPORT_STEMS_KITFX, STRING_FOR_CONFIGURE_EXPORT_STEMS_KITFX, stemExport.splitKitsIncludeKitFX};
+PLACE_SDRAM_BSS ToggleBool configureSplitKitsReverbMenu{STRING_FOR_CONFIGURE_EXPORT_STEMS_REVERB,
+                                                        STRING_FOR_CONFIGURE_EXPORT_STEMS_REVERB,
+                                                        stemExport.splitKitsIncludeReverb};
+PLACE_SDRAM_BSS menu_item::stem_export::SplitKitsSubmenu configureSplitKitsMenu{
+    STRING_FOR_CONFIGURE_EXPORT_STEMS_SPLIT_KITS,
+    {
+        &configureSplitKitsEnabledMenu,
+        &configureSplitKitsKitFXMenu,
+        &configureSplitKitsReverbMenu,
+    },
+};
 PLACE_SDRAM_BSS menu_item::Submenu configureStemExportMenu{STRING_FOR_CONFIGURE_EXPORT_STEMS,
                                                            {
                                                                &configureNormalizationMenu,
@@ -1798,6 +1814,7 @@ PLACE_SDRAM_BSS menu_item::Submenu configureStemExportMenu{STRING_FOR_CONFIGURE_
                                                                &configureSongFXMenu,
                                                                &configureOfflineRenderingMenu,
                                                                &configureMixdownMenu,
+                                                               &configureSplitKitsMenu,
                                                            }};
 
 PLACE_SDRAM_BSS menu_item::Submenu stemExportMenu{

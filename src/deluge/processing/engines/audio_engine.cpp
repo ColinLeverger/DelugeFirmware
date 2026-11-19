@@ -856,7 +856,7 @@ void scheduleMidiGateOutISR(size_t numSamples);
 void setMonitoringMode();
 void renderSongFX(size_t numSamples);
 void renderSamplePreview(size_t numSamples);
-void renderReverb(size_t numSamples);
+void renderReverb(size_t numSamples, float returnGain = 1.f);
 void tickSongFinalizeWindows(size_t& numSamples);
 void flushMIDIGateBuffers();
 void renderAudio(size_t numSamples);
@@ -1020,14 +1020,40 @@ void renderAudioForStemExport(size_t numSamples) {
 	numHopsEndedThisRoutineCall = 0;
 	usbInputMonitoredByTrack = false;
 
+	// REVERB on and SONG FX off: each stem is its element's dry signal plus its reverb return, nothing from the
+	// song level. The song only renders its outputs (no MIX tap, song FX, song volume or song reverb send), the
+	// reverb return of the outputs' own sends is mixed in, and the MIX recorder is fed here instead.
+	bool dryWithReverb = stemExport.renderingDryWithReverb();
+
+	// In the mix, the song's volume stage scales the outputs but not the reverb return. The dry part is recorded
+	// at the MIX level (before that stage), so the return is scaled by its inverse to keep the mix's dry / wet
+	// balance. Read before rendering, as the song render advances any song volume automation.
+	float reverbReturnGain = 1.f;
+	if (dryWithReverb && currentSong != nullptr) {
+		int32_t songStageVolume = currentSong->getOutputStageVolume();
+		if (songStageVolume > 0) {
+			reverbReturnGain = 134217728.f / static_cast<float>(songStageVolume);
+		}
+	}
+
 	// Render audio for song
 	if (currentSong != nullptr) {
-		currentSong->renderAudio(renderingBuffer, reverbBuffer.data(), sideChainHitPending);
+		currentSong->renderAudio(renderingBuffer, reverbBuffer.data(), sideChainHitPending, dryWithReverb);
 	}
 
 	if (stemExport.includeSongFX) {
 		renderReverb(numSamples);
 		renderSongFX(numSamples);
+	}
+	else if (dryWithReverb) {
+		renderReverb(numSamples, reverbReturnGain);
+		// same tap and gain as the MIX tap in Song::renderAudioSongLevel(), with the reverb return added
+		for (SampleRecorder* mixRecorder = firstRecorder; mixRecorder != nullptr; mixRecorder = mixRecorder->next) {
+			if (mixRecorder->status < RecorderStatus::FINISHED_CAPTURING_BUT_STILL_WRITING
+			    && mixRecorder->mode == AudioInputChannel::MIX) {
+				mixRecorder->feedAudio(renderingBuffer, true);
+			}
+		}
 	}
 
 	// If we're recording final output for offline stem export with song FX
@@ -1154,7 +1180,8 @@ startAgain:
 void feedReverbBackdoorForGrain(int index, q31_t value) {
 	reverbMemory[index] += value;
 }
-void renderReverb(size_t numSamples) {
+/// returnGain scales the reverb return mixed into the render (stem export only, 1 otherwise)
+void renderReverb(size_t numSamples, float returnGain) {
 	std::span renderingBuffer{renderingMemory.data(), numSamples};
 	std::span reverbBuffer{reverbMemory.data(), numSamples};
 
@@ -1196,6 +1223,15 @@ void renderReverb(size_t numSamples) {
 		}
 		else {
 			reverbAmplitudeL = reverbAmplitudeR = reverbOutputVolume;
+		}
+
+		if (returnGain != 1.f) [[unlikely]] {
+			auto scale = [returnGain](int32_t amplitude) {
+				float scaled = static_cast<float>(amplitude) * returnGain;
+				return static_cast<int32_t>(std::clamp(scaled, -2147483648.f, 2147483520.f));
+			};
+			reverbAmplitudeL = scale(reverbAmplitudeL);
+			reverbAmplitudeR = scale(reverbAmplitudeR);
 		}
 
 		// Mix reverb into main render

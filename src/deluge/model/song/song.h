@@ -278,7 +278,11 @@ public:
 	Error readFromFile(Deserializer& reader);
 	void writeToFile();
 	void loadAllSamples(bool mayActuallyReadFiles = true);
-	void renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuffer, int32_t sideChainHitPending);
+	void renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuffer, int32_t sideChainHitPending,
+	                 bool outputsOnly = false);
+	void renderAudioSongLevel(std::span<StereoSample> outputBuffer, int32_t* reverbBuffer, int32_t volumePostFX);
+	/// gain the song's volume stage in renderAudio() applies to the sum of the outputs, 2^27 being unity
+	int32_t getOutputStageVolume();
 	bool isYNoteAllowed(int32_t yNote, bool inKeyMode);
 	Clip* syncScalingClip;
 	void setTimePerTimerTick(uint64_t newTimeBig, bool shouldLogAction = false);

@@ -29,9 +29,14 @@
 #include "hid/display/oled.h"
 #include "hid/led/indicator_leds.h"
 #include "model/clip/clip.h"
+#include "model/clip/clip_instance.h"
 #include "model/clip/instrument_clip.h"
+#include "model/drum/drum.h"
+#include "model/instrument/kit.h"
 #include "model/instrument/non_audio_instrument.h"
+#include "model/mod_controllable/mod_controllable_audio.h"
 #include "model/note/note_row.h"
+#include "model/song/clip_iterators.h"
 #include "model/song/song.h"
 #include "playback/mode/arrangement.h"
 #include "playback/mode/session.h"
@@ -73,6 +78,11 @@ StemExport::StemExport() {
 	includeKitFX = false;
 	renderOffline = true;
 	exportMixdown = false;
+	splitKitsIntoDrums = false;
+	splitKitsIncludeKitFX = true;
+	splitKitsIncludeReverb = true;
+	splitKitsActive = false;
+	currentSplitKit = nullptr;
 
 	timePlaybackStopped = 0xFFFFFFFF;
 	timeThereWasLastSomeActivity = 0xFFFFFFFF;
@@ -88,6 +98,9 @@ void StemExport::startStemExportProcess(StemExportType stemExportType) {
 
 	currentStemExportType = stemExportType;
 	processStarted = true;
+	// splitting kits only applies to arranger track export; latch it for the whole job
+	splitKitsActive = (stemExportType == StemExportType::TRACK) && splitKitsIntoDrums;
+	currentSplitKit = nullptr;
 
 	// exit save UI mode and turn off save button LED
 	exitUIMode(UI_MODE_HOLDING_SAVE_BUTTON);
@@ -129,6 +142,10 @@ void StemExport::startStemExportProcess(StemExportType stemExportType) {
 		updateScrollPosition(stemExportType, elementsProcessed);
 	}
 
+	// every kit row mute was restored by exportInstrumentStems, so the split mode can be released
+	splitKitsActive = false;
+	currentSplitKit = nullptr;
+
 	// turn off recording if it's still on
 	if (playbackHandler.recording != RecordingMode::OFF) {
 		playbackHandler.recording = RecordingMode::OFF;
@@ -166,6 +183,12 @@ void StemExport::abortStemExportProcess(deluge::l10n::String reason) {
 void StemExport::startOutputRecordingUntilLoopEndAndSilence() {
 	timePlaybackStopped = 0xFFFFFFFF;
 	timeThereWasLastSomeActivity = 0xFFFFFFFF;
+	// the reverb is shared by every element: when it is in the stems, empty it so the previous stem's reverb tail
+	// (or reverb from before the export) doesn't bleed into this one. With SONG FX on, only split kits do this
+	// (in cutAllSoundBeforeNextStem), so that mode exports as before.
+	if (renderingDryWithReverb()) {
+		clearReverb();
+	}
 	playbackHandler.playButtonPressed(kInternalButtonPressLatency);
 	if (playbackHandler.isEitherClockActive()) {
 		// default - record the MIX (before SongFX)
@@ -186,6 +209,12 @@ void StemExport::startOutputRecordingUntilLoopEndAndSilence() {
 		audioRecorder.beginOutputRecording(AudioRecordingFolder::STEMS, channel, writeLoopEndPos(), normalization);
 		if (audioRecorder.recordingSource > AudioInputChannel::NONE) {
 			stopRecording = true;
+			// when splitting kits every stem must have the same length: end the recording on the exact tick
+			// the arrangement ends (Arrangement::doTickForward), instead of whenever the yield loop next polls.
+			// setupPlayback() clears this flag, so it has to be set after playback has started.
+			if (splitKitsActive) {
+				playbackHandler.stopOutputRecordingAtLoopEnd = true;
+			}
 		}
 	}
 }
@@ -206,7 +235,8 @@ void StemExport::stopOutputRecording() {
 		// if silence is found and you are currently resampling, stop recording soon
 		// if not exporting to silence, stop recording soon
 		// if you cancelled stem export and exited out of UI mode, stop recording soon
-		if (!isUIModeActive(UI_MODE_STEM_EXPORT) || !exportToSilence || (exportToSilence && checkForSilence())) {
+		if (!isUIModeActive(UI_MODE_STEM_EXPORT) || !shouldExportToSilence()
+		    || (shouldExportToSilence() && checkForSilence())) {
 			audioRecorder.endRecordingSoon();
 			stopRecording = false;
 		}
@@ -277,6 +307,13 @@ int32_t StemExport::disarmAllInstrumentsForStemExport(StemExportType stemExportT
 	// when we begin stem export, we haven't exported any instruments yet, so initialize these variables
 	numStemsExported = 0;
 	totalNumStemsToExport = 0;
+
+	// save every kit row mute before anything is changed: drum eligibility below is decided on the saved state,
+	// and restoreAllInstrumentMutes() puts them back
+	if (splitKitsActive) {
+		saveAllKitRowMutesForSplitExport();
+	}
+
 	// when we trigger stem export, we don't know how many instruments there are yet
 	// so get the number and store it so we only need to ping getNumElements once
 	int32_t totalNumOutputs = currentSong->getNumOutputs();
@@ -294,8 +331,13 @@ int32_t StemExport::disarmAllInstrumentsForStemExport(StemExportType stemExportT
 				OutputType outputType = output->type;
 				if (!output->mutedInArrangementMode && !output->isEmpty(false) && outputType != OutputType::MIDI_OUT
 				    && outputType != OutputType::CV) {
-					output->exportStem = true;
-					totalNumStemsToExport++;
+					// when splitting kits, a kit gives one stem per eligible drum (and none if no drum is eligible)
+					int32_t numStems = 1;
+					if (splitKitsActive && outputType == OutputType::KIT) {
+						numStems = countDrumStemsForSplitKit((Kit*)output);
+					}
+					output->exportStem = (numStems != 0);
+					totalNumStemsToExport += numStems;
 				}
 				else {
 					output->exportStem = false;
@@ -334,6 +376,183 @@ void StemExport::restoreAllInstrumentMutes(int32_t totalNumOutputs) {
 			}
 		}
 	}
+
+	if (splitKitsActive) {
+		restoreAllKitRowMutesAfterSplitExport();
+	}
+}
+
+/// split kits: a drum gets its own stem if it is a sound drum that has notes, in a row the user has not muted,
+/// in at least one of the kit's clips that is actually placed in the arrangement. A drum whose notes are only in
+/// clips that never play in the arrangement would give a silent stem, so it is skipped.
+/// Uses the row mutes saved by saveAllKitRowMutesForSplitExport(), so it gives the same answer during the export.
+bool StemExport::isDrumEligibleForSplitExport(Kit* kit, Drum* drum) {
+	if (drum == nullptr || drum->type != DrumType::SOUND) {
+		return false;
+	}
+	int32_t numClipInstances = kit->clipInstances.getNumElements();
+	for (int32_t i = 0; i < numClipInstances; i++) {
+		ClipInstance* clipInstance = kit->clipInstances.getElement(i);
+		if (clipInstance == nullptr || clipInstance->clip == nullptr
+		    || clipInstance->clip->type != ClipType::INSTRUMENT) {
+			continue;
+		}
+		NoteRow* noteRow = ((InstrumentClip*)clipInstance->clip)->getNoteRowForDrum(drum);
+		if (noteRow != nullptr && !noteRow->mutedBeforeStemExport && !noteRow->hasNoNotes()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/// split kits: number of stems this kit will give
+int32_t StemExport::countDrumStemsForSplitKit(Kit* kit) {
+	int32_t numDrumStems = 0;
+	for (Drum* drum = kit->firstDrum; drum != nullptr; drum = drum->next) {
+		if (isDrumEligibleForSplitExport(kit, drum)) {
+			numDrumStems++;
+		}
+	}
+	return numDrumStems;
+}
+
+/// split kits: save the mute state of every row of every kit clip (session and arrangement-only clips), since
+/// a drum pass mutes the other rows of its kit in all of that kit's clips
+void StemExport::saveAllKitRowMutesForSplitExport() {
+	for (InstrumentClip* clip : InstrumentClips::everywhere(currentSong)) {
+		if (clip->output == nullptr || clip->output->type != OutputType::KIT) {
+			continue;
+		}
+		int32_t numNoteRows = clip->noteRows.getNumElements();
+		for (int32_t i = 0; i < numNoteRows; i++) {
+			NoteRow* noteRow = clip->noteRows.getElement(i);
+			if (noteRow != nullptr) {
+				noteRow->mutedBeforeStemExport = noteRow->muted;
+			}
+		}
+	}
+}
+
+/// split kits: put back every kit row mute saved by saveAllKitRowMutesForSplitExport()
+/// called from restoreAllInstrumentMutes(), which runs whether the export finished or was cancelled
+void StemExport::restoreAllKitRowMutesAfterSplitExport() {
+	for (InstrumentClip* clip : InstrumentClips::everywhere(currentSong)) {
+		if (clip->output == nullptr || clip->output->type != OutputType::KIT) {
+			continue;
+		}
+		int32_t numNoteRows = clip->noteRows.getNumElements();
+		for (int32_t i = 0; i < numNoteRows; i++) {
+			NoteRow* noteRow = clip->noteRows.getElement(i);
+			if (noteRow != nullptr) {
+				noteRow->muted = noteRow->mutedBeforeStemExport;
+			}
+		}
+	}
+}
+
+/// split kits: in every clip of this kit, let only the target drum's row play
+/// (a row the user had muted stays muted, even for the target drum)
+void StemExport::muteAllKitRowsExceptDrum(Kit* kit, Drum* drum) {
+	for (InstrumentClip* clip : InstrumentClips::everywhere(currentSong)) {
+		if (clip->output != kit) {
+			continue;
+		}
+		int32_t numNoteRows = clip->noteRows.getNumElements();
+		for (int32_t i = 0; i < numNoteRows; i++) {
+			NoteRow* noteRow = clip->noteRows.getElement(i);
+			if (noteRow != nullptr) {
+				noteRow->muted = noteRow->mutedBeforeStemExport || noteRow->drum != drum;
+			}
+		}
+	}
+}
+
+/// split kits: stop every voice and empty every FX buffer that could still be ringing from the previous stem
+/// (or from before the export started), so nothing bleeds into the start of the next stem.
+/// Only called between passes, while playback is stopped and no recording is running.
+void StemExport::cutAllSoundBeforeNextStem() {
+	// voices of every sound (synths and kit drums) and of every audio track
+	AudioEngine::killAllVoices();
+
+	for (Output* output = currentSong->firstOutput; output != nullptr; output = output->next) {
+		OutputType outputType = output->type;
+		if (outputType != OutputType::SYNTH && outputType != OutputType::KIT && outputType != OutputType::AUDIO) {
+			continue;
+		}
+		// delay buffers and stutter of the track (for a synth, also voices, arp and sidechain)
+		auto* modControllable = static_cast<ModControllableAudio*>(output->toModControllable());
+		if (modControllable != nullptr) {
+			modControllable->wontBeRenderedForAWhile();
+		}
+		// each drum of a kit has its own delay, arp and sidechain
+		if (outputType == OutputType::KIT) {
+			for (Drum* drum = ((Kit*)output)->firstDrum; drum != nullptr; drum = drum->next) {
+				drum->drumWontBeRenderedForAWhile();
+			}
+		}
+	}
+
+	// song FX are only in the stems when included: clear the song delay
+	if (includeSongFX) {
+		currentSong->globalEffectable.wontBeRenderedForAWhile();
+	}
+	// clear the reverb tail when the reverb is in the stems
+	if (includeSongFX || renderingDryWithReverb()) {
+		clearReverb();
+	}
+}
+
+/// empty the shared reverb, so no tail is left in it
+void StemExport::clearReverb() {
+	// the reverb has no clear(), but re-creating the current model gives it empty buffers
+	AudioEngine::reverb.setModel(AudioEngine::reverb.getModel());
+	AudioEngine::mustUpdateReverbParamsBeforeNextRender = true;
+}
+
+/// split kits: export one stem per eligible drum of this kit, each pass muting every other row of the kit
+/// in every clip of the kit. The row mutes are restored by restoreAllInstrumentMutes(), on finish and on cancel.
+void StemExport::exportSplitKitDrumStems(StemExportType stemExportType, Kit* kit, int32_t idxOutput) {
+	// skipped kit (muted, empty, or no eligible drum): just scroll past it, like startCurrentStemExport() does
+	if (!kit->exportStem) {
+		updateScrollPosition(stemExportType, idxOutput + 1);
+		return;
+	}
+
+	int32_t drumNumber = 0;
+	for (Drum* drum = kit->firstDrum; drum != nullptr; drum = drum->next, drumNumber++) {
+		if (!isDrumEligibleForSplitExport(kit, drum)) {
+			continue;
+		}
+
+		muteAllKitRowsExceptDrum(kit, drum);
+		currentSplitKit = kit;
+
+		bool started = startCurrentStemExport(stemExportType, kit, kit->mutedInArrangementMode, idxOutput, true,
+		                                      (SoundDrum*)drum, drumNumber);
+		if (!started) {
+			// exportStem is true, so this only happens when the export was aborted
+			currentSplitKit = nullptr;
+			break;
+		}
+
+		// wait until recording is done and playback is turned off
+		yield([]() {
+			if (stemExport.stopRecording) {
+				stemExport.stopOutputRecording();
+			}
+			return !(playbackHandler.recording != RecordingMode::OFF
+			         || audioRecorder.recordingSource > AudioInputChannel::NONE
+			         || playbackHandler.isEitherClockActive());
+		});
+
+		finishCurrentStemExport(stemExportType, kit->mutedInArrangementMode);
+		currentSplitKit = nullptr;
+
+		// in the event that stem exporting is cancelled while iterating through drums, stop here
+		if (!isUIModeActive(UI_MODE_STEM_EXPORT)) {
+			break;
+		}
+	}
 }
 
 /// iterates through all instruments, arming one instrument at a time for recording
@@ -347,7 +566,11 @@ int32_t StemExport::exportInstrumentStems(StemExportType stemExportType) {
 		// now we're going to iterate through all instruments to find the ones that should be exported
 		for (int32_t idxOutput = totalNumOutputs - 1; idxOutput >= 0; --idxOutput) {
 			Output* output = currentSong->getOutputFromIndex(idxOutput);
-			if (output != nullptr) {
+			if (output != nullptr && splitKitsActive && output->type == OutputType::KIT) {
+				// one pass per drum of this kit
+				exportSplitKitDrumStems(stemExportType, (Kit*)output, idxOutput);
+			}
+			else if (output != nullptr) {
 				bool started = startCurrentStemExport(stemExportType, output, output->mutedInArrangementMode, idxOutput,
 				                                      output->exportStem);
 
@@ -693,7 +916,7 @@ int32_t StemExport::exportDrumStems(StemExportType stemExportType) {
 }
 
 bool StemExport::startCurrentStemExport(StemExportType stemExportType, Output* output, bool& muteState,
-                                        int32_t indexNumber, bool exportStem, SoundDrum* drum) {
+                                        int32_t indexNumber, bool exportStem, SoundDrum* drum, int32_t drumNumber) {
 	updateScrollPosition(stemExportType, indexNumber + 1);
 
 	// exclude empty clips / outputs, muted outputs (arranger), MIDI and CV outputs
@@ -714,9 +937,15 @@ bool StemExport::startCurrentStemExport(StemExportType stemExportType, Output* o
 	uiNeedsRendering(getCurrentUI());
 
 	// set wav file name for stem to be exported
-	if (!setWavFileNameForStemExport(stemExportType, output, indexNumber, drum)) {
+	if (!setWavFileNameForStemExport(stemExportType, output, indexNumber, drum, drumNumber)) {
 		abortStemExportProcess(deluge::l10n::String::STRING_FOR_STEM_NAME_TOO_LONG);
 		return false;
+	}
+
+	// when splitting kits, the previous stem was cut at the arrangement end with its tails still sounding:
+	// silence them so they don't bleed into the start of this stem
+	if (splitKitsActive) {
+		cutAllSoundBeforeNextStem();
 	}
 
 	// start resampling which ends when end of track / clip is reached and audio is silent
@@ -825,7 +1054,7 @@ void StemExport::displayStemExportProgressOLED(StemExportType stemExportType) {
 		exportStatus.append(" clips");
 	}
 	else if (stemExportType == StemExportType::TRACK) {
-		exportStatus.append(" instruments");
+		exportStatus.append(splitKitsActive ? " stems" : " instruments");
 	}
 	else if (stemExportType == StemExportType::DRUM) {
 		exportStatus.append(" drums");
@@ -1089,7 +1318,7 @@ constexpr int32_t kMaxStemFileNameChars = FF_MAX_LFN;
 /// example: /KIT_DRUM_808 KIT_SNARE_ROOT NOTE_SCALE_00000.WAV
 /// this wavFileName is then concatenate to the filePath name to export the WAV file
 bool StemExport::setWavFileNameForStemExport(StemExportType stemExportType, Output* output, int32_t fileNumber,
-                                             SoundDrum* drum) {
+                                             SoundDrum* drum, int32_t drumNumber) {
 	// wavFileNameForStemExport = "/"
 	Error error = wavFileNameForStemExport.set("/");
 	if (error != Error::NONE) {
@@ -1160,6 +1389,13 @@ bool StemExport::setWavFileNameForStemExport(StemExportType stemExportType, Outp
 	else if (stemExportType == StemExportType::DRUM) {
 		length = snprintf(fileName, sizeof(fileName), "%s_%s_%s_%s_%dBPM_%s-%s_%03d.WAV", outputType, exportType,
 		                  outputName, drum->drumName.c_str(), tempo, noteName, scaleName, fileNumber);
+	}
+	// split kit drum in arranger (a drum is only passed with TRACK export when splitting kits):
+	// wavFileNameForStemExport = /KIT_TRACK_KitName_DrumName_tempo_noteName-scaleName_###-###.WAV
+	// the second number is the drum's position in the kit, so two drums with the same name can't collide
+	else if (drum != nullptr) {
+		length = snprintf(fileName, sizeof(fileName), "%s_%s_%s_%s_%dBPM_%s-%s_%03d-%03d.WAV", outputType, exportType,
+		                  outputName, drum->drumName.c_str(), tempo, noteName, scaleName, fileNumber, drumNumber);
 	}
 	// wavFileNameForStemExport = /OutputType_StemExportType_OutputName_tempo_noteName-scaleName_###.WAV
 	else {

@@ -2497,7 +2497,11 @@ void Song::deleteSoundsWhichWontSound() {
 	deleteAllBackedUpParamManagersWithClips();
 }
 
-void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuffer, int32_t sideChainHitPending) {
+/// outputsOnly: only render the outputs (their own FX and reverb sends included) and stop there - no MIX recording
+/// tap, no song FX, no song volume, no song reverb send. Used by stem export to record each element with its reverb
+/// but without anything from the song level.
+void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuffer, int32_t sideChainHitPending,
+                       bool outputsOnly) {
 
 	// int32_t volumePostFX = getParamNeutralValue(params::GLOBAL_VOLUME_POST_FX);
 	int32_t volumePostFX =
@@ -2535,6 +2539,37 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 #endif
 	}
 	AudioEngine::logAction("done rendering outputs");
+	if (!outputsOnly) {
+		renderAudioSongLevel(outputBuffer, reverbBuffer, volumePostFX);
+	}
+
+	if (playbackHandler.isEitherClockActive() && !playbackHandler.ticksLeftInCountIn
+	    && currentPlaybackMode == &arrangement) {
+		const bool result = params::kMaxNumUnpatchedParams > 32
+		                        ? paramManager.getUnpatchedParamSetSummary()->whichParamsAreInterpolating[0]
+		                              || paramManager.getUnpatchedParamSetSummary()->whichParamsAreInterpolating[1]
+		                        : paramManager.getUnpatchedParamSetSummary()->whichParamsAreInterpolating[0];
+		if (result) {
+			ModelStackWithThreeMainThings* modelStackWithThreeMainThings = addToModelStack(modelStack);
+			paramManager.tickSamples(outputBuffer.size(), modelStackWithThreeMainThings);
+		}
+	}
+	AudioEngine::logAction("done render");
+}
+
+int32_t Song::getOutputStageVolume() {
+	// same computation as renderAudio() and renderAudioSongLevel()
+	int32_t volumePostFX =
+	    getFinalParameterValueVolume(
+	        134217728,
+	        cableToLinearParamShortcut(paramManager.getUnpatchedParamSet()->getValue(params::UNPATCHED_VOLUME)))
+	    >> kSongVolumeAdjustmentShift;
+	int32_t postReverbVolume = paramNeutralValues[params::GLOBAL_VOLUME_POST_REVERB_SEND];
+	return multiply_32x32_rshift32(postReverbVolume, volumePostFX) << 5;
+}
+
+/// the song level part of renderAudio(): MIX recording tap, then song FX, song volume and song reverb send
+void Song::renderAudioSongLevel(std::span<StereoSample> outputBuffer, int32_t* reverbBuffer, int32_t volumePostFX) {
 	// If recording the "MIX", this is the place where we want to grab it - before any master FX or volume applied
 	// Go through each SampleRecorder, feeding them audio
 	for (SampleRecorder* recorder = AudioEngine::firstRecorder; recorder; recorder = recorder->next) {
@@ -2565,19 +2600,6 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 	globalEffectable.processReverbSendAndVolume(outputBuffer, reverbBuffer, volumePostFX, postReverbVolume,
 	                                            reverbSendAmount >> 1);
 	AudioEngine::logAction("done global effectables");
-
-	if (playbackHandler.isEitherClockActive() && !playbackHandler.ticksLeftInCountIn
-	    && currentPlaybackMode == &arrangement) {
-		const bool result = params::kMaxNumUnpatchedParams > 32
-		                        ? paramManager.getUnpatchedParamSetSummary()->whichParamsAreInterpolating[0]
-		                              || paramManager.getUnpatchedParamSetSummary()->whichParamsAreInterpolating[1]
-		                        : paramManager.getUnpatchedParamSetSummary()->whichParamsAreInterpolating[0];
-		if (result) {
-			ModelStackWithThreeMainThings* modelStackWithThreeMainThings = addToModelStack(modelStack);
-			paramManager.tickSamples(outputBuffer.size(), modelStackWithThreeMainThings);
-		}
-	}
-	AudioEngine::logAction("done render");
 }
 
 void Song::setTimePerTimerTick(uint64_t newTimeBig, bool shouldLogAction) {

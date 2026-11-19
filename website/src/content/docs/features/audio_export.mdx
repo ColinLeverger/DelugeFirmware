@@ -65,7 +65,11 @@ SYNTH_CLIP_PRESETNAME_###BPM_Root Note-Scale Name_000.WAV
 SYNTH_TRACK_PRESETNAME_###BPM_Root Note-Scale Name_000.WAV
 MIXDOWN_###BPM_Root Note-Scale Name.WAV
 KIT_DRUM_KITNAME_DRUMNAME_Root Note-Scale Name_000.WAV
+KIT_TRACK_KITNAME_DRUMNAME_###BPM_Root Note-Scale Name_000-000.WAV
 ```
+
+The last form is used when `SPLIT KITS` is enabled in Arranger View (see below). The first number is the track
+number, the second is the position of the drum in the kit, so two drums with the same name never overwrite each other.
 
 ## Shortcuts to Start/Stop Exporting
 
@@ -97,6 +101,7 @@ KIT_DRUM_KITNAME_DRUMNAME_Root Note-Scale Name_000.WAV
   - In Arranger, a track is played until the end of the arrangement's length is reached.
   - In Session, a clip is played until the end of the longest note row with notes in it is reached.
   - In Kit Instrument Clip View, a drum is played until the end of the drum row is reached.
+  - In Arranger View with `SPLIT KITS` enabled, every file (drum and track) is exactly the length of the arrangement. `EXPORT TO SILENCE` is ignored in this mode (see below).
   - If `EXPORT TO SILENCE` is enabled, tails will be allowed to ring out and recording will continue past the track, clip or drum length until silence is reached (see below).
 
 ### Silence
@@ -120,7 +125,7 @@ KIT_DRUM_KITNAME_DRUMNAME_Root Note-Scale Name_000.WAV
 
 ### Kit FX <Badge text="c1.3" variant="tip" />
 
-- This is applicable for exporting Kit Drums only and is not visible in the Session and Arranger Audio Export menu's
+- This is applicable for exporting Kit Drums only and is not visible in the Session and Arranger Audio Export menu's. `SPLIT KITS` has its own `KIT FX` setting (see below).
 - By default, Kit FX are excluded (these are the Kit Global FX in Kit Instrument Clips when :key[AffectEntire] is enabled).
 - They can be included in the export configuration menu located at: `KIT FX/ACTIONS/EXPORT AUDIO/CONFIGURE EXPORT/KIT FX`
   - Note: When Kit FX are excluded, the Kit Global FX pitch adjustment will still be included
@@ -142,6 +147,38 @@ KIT_DRUM_KITNAME_DRUMNAME_Root Note-Scale Name_000.WAV
 - Exporting all unmuted tracks as a single stereo file is disabled by default.
 - This can be enabled in the export configuration menu located at: `SONG/EXPORT AUDIO/CONFIGURE EXPORT/EXPORT MIXDOWN`
 
+### Split Kits
+
+- This is only applicable when exporting from Arranger, and it is disabled by default. The menu is only shown in Arranger View.
+- It is configured in its own submenu: `SONG/EXPORT AUDIO/CONFIGURE EXPORT/SPLIT KITS`
+  - `ENABLED`: turns the mode on.
+  - `KIT FX`: drum stems keep the Kit FX. On by default, so drum stems sound the way the drums sound in the mix. This setting is separate from the `KIT FX` setting of Kit Instrument Clip View exports.
+  - `REVERB`: stems keep their reverb. On by default (see Reverb below).
+- These settings only apply to a split kits export. When `SPLIT KITS` is disabled, every export works as before.
+- When enabled, each kit track is exported as one file per drum (kick, snare, hat...) instead of one file per kit. Synth and audio tracks are still exported as one file each.
+- A drum is exported when it is a sample/synth drum that has notes, in a row that is not muted, in at least one clip of the kit that is placed in the arrangement. MIDI and CV drums are skipped.
+- To export a drum, the other rows of its kit are muted in every clip of that kit. Your row mutes are put back when the export finishes or when you cancel it.
+- Every file has the same length: the length of the arrangement. So the files line up when you import them into a DAW. To get this:
+  - `EXPORT TO SILENCE` is ignored. Each file stops at the end of the arrangement, so tails that ring past the end are cut. Add an empty bar at the end of the arrangement to keep them.
+  - Before each file starts, all sounds and FX tails still ringing from the previous file are stopped, so nothing bleeds into the next file.
+- If `EXPORT MIXDOWN` is also enabled, the mixdown is exported and `SPLIT KITS` has no effect.
+- Known limits: each drum is rendered on its own, so the result is not always identical to the sum of the drums in the mix:
+  - Sidechain: when a drum (e.g. the kick) triggers sidechain ducking on other sounds, the ducking is not reproduced on the other stems, because the trigger drum is muted while they are rendered.
+  - Kit FX that react to the level of the signal (kit compressor, saturation/distortion) only see one drum at a time, so they act differently than on the full kit.
+  - Equal length is exact when `SONG FX` is off. With `SONG FX` on, the length can differ by a few samples between files.
+
+#### Reverb
+
+- The Deluge has one reverb, shared by every sound. Each synth, kit, drum and audio track sends part of its signal to it with its own reverb amount. Without `SONG FX`, exports do not contain any reverb.
+- With `SPLIT KITS/REVERB` on and `SONG FX` off, each file contains the reverb of what it plays, but none of the other Song FX.
+  - The reverb is mixed in with the same dry / wet balance as in the song.
+  - The Song level reverb send (the reverb amount in the Song FX menu) is not included, because it would send the whole song to the reverb.
+  - Before each file starts, the reverb is emptied, so the reverb tail of the previous file does not bleed into the next one.
+- When `SONG FX` is on, files include the reverb and all the other Song FX, whatever the `REVERB` setting.
+- `REVERB` only works with `OFFLINE RENDERING` (the default). With `OFFLINE RENDERING` off, it has no effect.
+- If the reverb sidechain is used (the reverb ducked by sidechain hits), the ducking is only reproduced in files that contain the sound that triggers it. For example, the reverb on the snare stem is not ducked by the kick, because the kick is muted while the snare is rendered.
+- If the song volume is set more than about 6 dB below its default, the reverb in the files is quieter than in the song.
+
 ## Audio Export Menu
 
 A new `EXPORT AUDIO` menu has been added to the `SONG` menu accessible in Session and Arranger Views and in <Badge text="c1.3" variant="tip" /> the `KIT FX/ACTIONS/` menu is accessible in Kit Instrument Clip View.
@@ -158,6 +195,7 @@ This menu allows you to start an export and configure various settings related t
     - `SONG FX`: Exports are rendered with or without Song FX applied.
     - `OFFLINE RENDERING`: Exports are rendered offline. You will not hear any audio playback, as exports are rendered at a faster than real-time basis.
     - `EXPORT MIXDOWN`: A single master mixdown track is exported for all unmuted tracks in Arranger View.
+    - `SPLIT KITS` (Arranger View only): each kit is exported as one file per drum, and every file has the length of the arrangement. Has its own `KIT FX` and `REVERB` settings.
 
 ## Multi-Sampling using Kit Audio Export <Badge text="c1.3" variant="tip" />
 
@@ -224,7 +262,7 @@ If you want to continue using the `EXPORT TO SILENCE` feature, check what might 
 
 If you are not using the `EXPORT TO SILENCE` feature, it is possible that while exporting, the audio from the previous render may bleed into the start of the next render.
 
-Other than using the `EXPORT TO SILENCE` feature, we do not have a solution for this yet. Ideally if we can find a way to cut any sustaining audio from the previous track / clip rendered that would ensure that no bleed occurs, however we have not found a way to do this yet.
+Other than using the `EXPORT TO SILENCE` feature, we do not have a solution for this yet for Clip, Drum and normal Track exports. With `SPLIT KITS` enabled in Arranger View, all sounds and FX tails are stopped before each file starts, so this bleed does not occur. Ideally if we can find a way to cut any sustaining audio from the previous track / clip rendered that would ensure that no bleed occurs, however we have not found a way to do this yet.
 
 ## Videos
 
